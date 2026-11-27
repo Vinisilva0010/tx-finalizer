@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tx_core::{
-    BlockInclusion, BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError,
-    ObservationStatus, SignedPayload,
+    BlockInclusion, BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError, ObservationStatus,
+    SignedPayload,
 };
 
 /// Adaptador Solana que reenvia os mesmos bytes assinados em Base64 (`skipPreflight: true` opcional
@@ -35,7 +35,11 @@ impl SolanaRpcAdapter {
         })
     }
 
-    async fn rpc_call(&self, method: &str, params: Value) -> Result<JsonRpcResponse, reqwest::Error> {
+    async fn rpc_call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<JsonRpcResponse, reqwest::Error> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -143,7 +147,9 @@ impl ChainAdapter for SolanaRpcAdapter {
                 }
                 BroadcastOutcome::UnknownTimeout("resposta RPC Solana vazia".into())
             }
-            Err(e) => BroadcastOutcome::UnknownTimeout(format!("falha de rede/timeout Solana: {e}")),
+            Err(e) => {
+                BroadcastOutcome::UnknownTimeout(format!("falha de rede/timeout Solana: {e}"))
+            }
         }
     }
 
@@ -167,11 +173,13 @@ impl ChainAdapter for SolanaRpcAdapter {
                 json!([[payload.tx_hash], { "searchTransactionHistory": true }]),
             )
             .await
-            .map_err(|e| CoreError::Storage(format!("falha ao consultar assinatura Solana: {e}")))?;
+            .map_err(|e| {
+                CoreError::Storage(format!("falha ao consultar assinatura Solana: {e}"))
+            })?;
 
-        let status_val = status_resp
-            .result
-            .ok_or_else(|| CoreError::Storage("resultado ausente em getSignatureStatuses".into()))?;
+        let status_val = status_resp.result.ok_or_else(|| {
+            CoreError::Storage("resultado ausente em getSignatureStatuses".into())
+        })?;
 
         let parsed: SignatureStatusesResult = serde_json::from_value(status_val)
             .map_err(|e| CoreError::Storage(format!("parse getSignatureStatuses: {e}")))?;
@@ -180,7 +188,9 @@ impl ChainAdapter for SolanaRpcAdapter {
         let height_resp = self
             .rpc_call("getBlockHeight", json!([{ "commitment": "finalized" }]))
             .await
-            .map_err(|e| CoreError::Storage(format!("falha ao consultar blockHeight Solana: {e}")))?;
+            .map_err(|e| {
+                CoreError::Storage(format!("falha ao consultar blockHeight Solana: {e}"))
+            })?;
 
         let current_block_height = height_resp
             .result

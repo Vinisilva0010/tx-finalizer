@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 use tx_core::{
-    BlockInclusion, BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError,
-    ObservationStatus, SignedPayload,
+    BlockInclusion, BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError, ObservationStatus,
+    SignedPayload,
 };
 
 /// Adaptador EVM que envia estritamente `raw_bytes` via `eth_sendRawTransaction`
@@ -29,7 +29,11 @@ impl EvmRpcAdapter {
         })
     }
 
-    async fn rpc_call(&self, method: &str, params: Value) -> Result<JsonRpcResponse, reqwest::Error> {
+    async fn rpc_call(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<JsonRpcResponse, reqwest::Error> {
         let body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -100,7 +104,10 @@ impl ChainAdapter for EvmRpcAdapter {
         }
 
         let raw_hex = encode_hex_prefixed(&payload.raw_bytes);
-        match self.rpc_call("eth_sendRawTransaction", json!([raw_hex])).await {
+        match self
+            .rpc_call("eth_sendRawTransaction", json!([raw_hex]))
+            .await
+        {
             Ok(resp) => {
                 if resp.result.is_some() {
                     return BroadcastOutcome::Accepted;
@@ -144,12 +151,11 @@ impl ChainAdapter for EvmRpcAdapter {
             .await
             .map_err(|e| CoreError::Storage(format!("falha ao ler bloco latest EVM: {e}")))?;
 
-        let latest_block: EvmBlockHeader = serde_json::from_value(
-            latest_resp
-                .result
-                .ok_or_else(|| CoreError::Storage("bloco latest ausente na resposta EVM".into()))?,
-        )
-        .map_err(|e| CoreError::Storage(format!("parse bloco latest EVM: {e}")))?;
+        let latest_block: EvmBlockHeader =
+            serde_json::from_value(latest_resp.result.ok_or_else(|| {
+                CoreError::Storage("bloco latest ausente na resposta EVM".into())
+            })?)
+            .map_err(|e| CoreError::Storage(format!("parse bloco latest EVM: {e}")))?;
 
         let current_block_height = latest_block
             .number
@@ -163,12 +169,11 @@ impl ChainAdapter for EvmRpcAdapter {
             .await
             .map_err(|e| CoreError::Storage(format!("falha ao ler bloco finalized EVM: {e}")))?;
 
-        let finalized_block: EvmBlockHeader = serde_json::from_value(
-            finalized_resp
-                .result
-                .ok_or_else(|| CoreError::Storage("bloco finalized ausente na resposta EVM".into()))?,
-        )
-        .map_err(|e| CoreError::Storage(format!("parse bloco finalized EVM: {e}")))?;
+        let finalized_block: EvmBlockHeader =
+            serde_json::from_value(finalized_resp.result.ok_or_else(|| {
+                CoreError::Storage("bloco finalized ausente na resposta EVM".into())
+            })?)
+            .map_err(|e| CoreError::Storage(format!("parse bloco finalized EVM: {e}")))?;
 
         let finalized_height = finalized_block
             .number
@@ -216,7 +221,9 @@ impl ChainAdapter for EvmRpcAdapter {
             let canonical_resp = self
                 .rpc_call("eth_getBlockByNumber", json!([bn_hex, false]))
                 .await
-                .map_err(|e| CoreError::Storage(format!("falha ao verificar bloco canônico EVM: {e}")))?;
+                .map_err(|e| {
+                    CoreError::Storage(format!("falha ao verificar bloco canônico EVM: {e}"))
+                })?;
 
             if let Some(val) = canonical_resp.result
                 && !val.is_null()

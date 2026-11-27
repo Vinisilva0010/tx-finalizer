@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 use thiserror::Error;
 
 /// Identificador idempotente único fornecido pelo chamador para evitar duplicação de intenção financeira.
@@ -88,7 +89,12 @@ pub enum TxState {
 
 impl TxState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TxState::Finalized { .. } | TxState::FinalizedFailed { .. } | TxState::ExpiredOrFailed { .. })
+        matches!(
+            self,
+            TxState::Finalized { .. }
+                | TxState::FinalizedFailed { .. }
+                | TxState::ExpiredOrFailed { .. }
+        )
     }
 }
 
@@ -173,6 +179,27 @@ pub trait ChainAdapter: Send + Sync {
     async fn broadcast_raw(&self, payload: &SignedPayload) -> BroadcastOutcome;
     /// Consulta o estado atual da transação e verifica finalidade e reorganizações.
     async fn observe(&self, payload: &SignedPayload) -> Result<ObservationStatus, CoreError>;
+}
+
+/// Política conservadora de polling com backoff exponencial.
+/// Atingir `max_steps` nunca marca a transação como falha/expirada; apenas devolve o estado atual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollPolicy {
+    pub initial_interval: Duration,
+    pub max_interval: Duration,
+    pub backoff_multiplier: u32,
+    pub max_steps: u32,
+}
+
+impl Default for PollPolicy {
+    fn default() -> Self {
+        Self {
+            initial_interval: Duration::from_secs(2),
+            max_interval: Duration::from_secs(30),
+            backoff_multiplier: 2,
+            max_steps: 30,
+        }
+    }
 }
 
 /// Orquestrador agnóstico de cadeia que aplica as invariantes de não-duplicação e finalidade.
@@ -267,24 +294,22 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
                 record.version += 1;
                 return self.store.compare_and_swap(record).await;
             }
-            ObservationStatus::IncludedNotFinalized { inclusion, .. } => {
-                match &record.state {
-                    TxState::IncludedTentative { inclusion: prev } if prev != &inclusion => {
-                        record.reorg_count += 1;
-                        record.state = TxState::IncludedTentative { inclusion };
-                        record.version += 1;
-                        return self.store.compare_and_swap(record).await;
-                    }
-                    TxState::IncludedTentative { .. } => {
-                        return Ok(record);
-                    }
-                    _ => {
-                        record.state = TxState::IncludedTentative { inclusion };
-                        record.version += 1;
-                        return self.store.compare_and_swap(record).await;
-                    }
+            ObservationStatus::IncludedNotFinalized { inclusion, .. } => match &record.state {
+                TxState::IncludedTentative { inclusion: prev } if prev != &inclusion => {
+                    record.reorg_count += 1;
+                    record.state = TxState::IncludedTentative { inclusion };
+                    record.version += 1;
+                    return self.store.compare_and_swap(record).await;
                 }
-            }
+                TxState::IncludedTentative { .. } => {
+                    return Ok(record);
+                }
+                _ => {
+                    record.state = TxState::IncludedTentative { inclusion };
+                    record.version += 1;
+                    return self.store.compare_and_swap(record).await;
+                }
+            },
             ObservationStatus::Expired {
                 current_block_height,
             } => {
@@ -334,5 +359,40 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
                 self.store.compare_and_swap(record).await
             }
         }
+    }
+
+    /// Executa ciclos de `step` com backoff exponencial até atingir um estado terminal
+    /// (`Finalized`, `FinalizedFailed` ou `ExpiredOrFailed`) ou até esgotar `policy.max_steps`.
+    /// Se `max_steps` for atingido antes da finalidade, retorna o registro atual intacto
+    /// (nunca converte limite local de polling em falha definitiva).
+    pub async fn drive_to_finality(
+        &self,
+        key: &IdempotencyKey,
+        policy: PollPolicy,
+    ) -> Result<TxRecord, CoreError> {
+        let mut delay = policy.initial_interval;
+        let mut last_record = self
+            .store
+            .get(key)
+            .await?
+            .ok_or_else(|| CoreError::Storage(format!("chave não encontrada: {}", key.0)))?;
+
+        if last_record.state.is_terminal() {
+            return Ok(last_record);
+        }
+
+        for step_idx in 0..policy.max_steps {
+            last_record = self.step(key).await?;
+            if last_record.state.is_terminal() {
+                return Ok(last_record);
+            }
+            if step_idx + 1 < policy.max_steps {
+                tokio::time::sleep(delay).await;
+                let mult = policy.backoff_multiplier.max(1);
+                delay = delay.saturating_mul(mult).min(policy.max_interval);
+            }
+        }
+
+        Ok(last_record)
     }
 }

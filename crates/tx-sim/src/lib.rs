@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tx_core::{
-    BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError, IdempotencyKey,
-    ObservationStatus, SignedPayload, TxRecord, TxSigner, TxStore,
+    BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError, IdempotencyKey, ObservationStatus,
+    SignedPayload, TxRecord, TxSigner, TxStore,
 };
 
 /// Armazenamento em memória com lock atômico e validação estrita de versão (CAS).
@@ -402,5 +402,68 @@ mod tests {
         let s2 = engine.step(&key).await.unwrap();
         assert!(matches!(s2.state, TxState::ExpiredOrFailed { .. }));
         assert!(s2.state.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn drive_to_finality_converges_and_respects_max_steps_conservatively() {
+        use std::time::Duration;
+        use tx_core::PollPolicy;
+
+        let store = InMemoryStore::default();
+        let chain = ChaosChain::new(
+            vec![
+                BroadcastOutcome::UnknownTimeout("timeout 1".into()),
+                BroadcastOutcome::Accepted,
+            ],
+            vec![
+                ObservationStatus::Pending {
+                    current_block_height: 1,
+                },
+                ObservationStatus::IncludedNotFinalized {
+                    inclusion: BlockInclusion {
+                        block_number: 2,
+                        block_hash: "0xblk2".into(),
+                    },
+                    current_block_height: 2,
+                },
+                ObservationStatus::Finalized {
+                    inclusion: BlockInclusion {
+                        block_number: 2,
+                        block_hash: "0xblk2".into(),
+                    },
+                },
+            ],
+        );
+
+        let engine = TxEngine::new(store, chain);
+        let signer = MockSigner {
+            sign_calls: Arc::new(AtomicUsize::new(0)),
+            mode: MockChainMode::Evm {
+                chain_id: 1,
+                nonce: 1,
+            },
+        };
+
+        let key = IdempotencyKey("driver-1".into());
+        engine
+            .prepare(key.clone(), &"pay_10".to_string(), &signer)
+            .await
+            .unwrap();
+
+        // Limite curto (2 passos): para em IncludedTentative, NUNCA marca como ExpiredOrFailed.
+        let short_policy = PollPolicy {
+            initial_interval: Duration::from_millis(1),
+            max_interval: Duration::from_millis(2),
+            backoff_multiplier: 2,
+            max_steps: 2,
+        };
+        let paused = engine.drive_to_finality(&key, short_policy).await.unwrap();
+        assert!(matches!(paused.state, TxState::IncludedTentative { .. }));
+        assert!(!paused.state.is_terminal());
+
+        // Retomada posterior com a mesma chave converge para Finalized.
+        let final_rec = engine.drive_to_finality(&key, short_policy).await.unwrap();
+        assert!(matches!(final_rec.state, TxState::Finalized { .. }));
+        assert!(final_rec.state.is_terminal());
     }
 }
