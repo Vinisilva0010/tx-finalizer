@@ -194,9 +194,10 @@ impl ChainAdapter for SolanaRpcAdapter {
             };
 
             if status.confirmation_status.as_deref() == Some("finalized") {
-                if let Some(_tx_err) = status.err {
-                    return Ok(ObservationStatus::Expired {
-                        current_block_height,
+                if let Some(tx_err) = status.err {
+                    return Ok(ObservationStatus::FinalizedFailed {
+                        inclusion,
+                        reason: format!("transação Solana falhou on-chain: {tx_err}"),
                     });
                 }
                 return Ok(ObservationStatus::Finalized { inclusion });
@@ -346,5 +347,41 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[tokio::test]
+    async fn solana_rpc_marks_finalized_err_as_finalized_failed() {
+        let script = vec![
+            r#"{"jsonrpc":"2.0","id":1,"result":{"value":[{"slot":300,"confirmationStatus":"finalized","err":{"InstructionError":[0,{"Custom":1}]}}]}}"#.into(),
+            r#"{"jsonrpc":"2.0","id":1,"result":180}"#.into(),
+        ];
+
+        let url = spawn_mock_solana_rpc(script).await;
+        let adapter = SolanaRpcAdapter::new(url, Duration::from_secs(1), true).unwrap();
+        let store = MemStore::default();
+        let key = IdempotencyKey("sol-err-1".into());
+        let payload = SignedPayload::new(
+            "5sigSolanaErr".into(),
+            Bytes::from_static(b"raw_solana_err_tx"),
+            ChainConstraint::Solana {
+                recent_blockhash: "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi".into(),
+                last_valid_block_height: 250,
+            },
+        );
+        store
+            .insert_if_absent(TxRecord {
+                idempotency_key: key.clone(),
+                payload,
+                state: TxState::SubmittedUnknown { attempts: 1 },
+                reorg_count: 0,
+                version: 1,
+            })
+            .await
+            .unwrap();
+
+        let engine = TxEngine::new(store, adapter);
+        let r = engine.step(&key).await.unwrap();
+        assert!(matches!(r.state, TxState::FinalizedFailed { .. }));
+        assert!(r.state.is_terminal());
     }
 }

@@ -64,6 +64,7 @@ struct JsonRpcError {
 struct EvmReceipt {
     block_number: Option<String>,
     block_hash: Option<String>,
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,6 +224,12 @@ impl ChainAdapter for EvmRpcAdapter {
                 let canonical_block: EvmBlockHeader = serde_json::from_value(val)
                     .map_err(|e| CoreError::Storage(format!("parse bloco canônico EVM: {e}")))?;
                 if canonical_block.hash.as_deref() == Some(bh.as_str()) {
+                    if receipt.status.as_deref() == Some("0x0") {
+                        return Ok(ObservationStatus::FinalizedFailed {
+                            inclusion,
+                            reason: "transação EVM revertida on-chain (status 0x0)".into(),
+                        });
+                    }
                     return Ok(ObservationStatus::Finalized { inclusion });
                 }
             }
@@ -395,5 +402,43 @@ mod tests {
                 }
             }
         );
+    }
+
+    #[tokio::test]
+    async fn evm_rpc_marks_reverted_finalized_tx_as_finalized_failed() {
+        let script = vec![
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x20","hash":"0x20"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x18","hash":"0x18"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"blockNumber":"0x15","blockHash":"0xreverted_block","status":"0x0"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x15","hash":"0xreverted_block"}}"#.into(), 0),
+        ];
+
+        let url = spawn_mock_evm_rpc(script).await;
+        let adapter = EvmRpcAdapter::new(url, Duration::from_secs(1)).unwrap();
+        let store = MemStore::default();
+        let key = IdempotencyKey("evm-revert-1".into());
+        let payload = SignedPayload::new(
+            "0xtx_revert".into(),
+            Bytes::from_static(b"\x02\xf8\x01\x02\x03"),
+            ChainConstraint::Evm {
+                chain_id: 1,
+                nonce: 9,
+            },
+        );
+        store
+            .insert_if_absent(TxRecord {
+                idempotency_key: key.clone(),
+                payload,
+                state: TxState::SubmittedUnknown { attempts: 1 },
+                reorg_count: 0,
+                version: 1,
+            })
+            .await
+            .unwrap();
+
+        let engine = TxEngine::new(store, adapter);
+        let r = engine.step(&key).await.unwrap();
+        assert!(matches!(r.state, TxState::FinalizedFailed { .. }));
+        assert!(r.state.is_terminal());
     }
 }

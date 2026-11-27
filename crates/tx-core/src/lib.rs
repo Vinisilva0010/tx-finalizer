@@ -75,15 +75,20 @@ pub enum TxState {
         previous_inclusion: BlockInclusion,
         reorg_count: u32,
     },
-    /// Estado terminal: bloco atingiu finalidade na rede.
+    /// Estado terminal: bloco atingiu finalidade na rede e a execução teve sucesso.
     Finalized { inclusion: BlockInclusion },
+    /// Estado terminal: bloco atingiu finalidade, mas a execução falhou/reverteu on-chain.
+    FinalizedFailed {
+        inclusion: BlockInclusion,
+        reason: String,
+    },
     /// Estado terminal: expirou na rede sem ser finalizada (seguro para emitir nova intenção se desejado).
     ExpiredOrFailed { reason: String },
 }
 
 impl TxState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, TxState::Finalized { .. } | TxState::ExpiredOrFailed { .. })
+        matches!(self, TxState::Finalized { .. } | TxState::FinalizedFailed { .. } | TxState::ExpiredOrFailed { .. })
     }
 }
 
@@ -134,8 +139,13 @@ pub enum ObservationStatus {
         inclusion: BlockInclusion,
         current_block_height: u64,
     },
-    /// Incluída em um bloco já finalizado pela rede.
+    /// Incluída em um bloco já finalizado pela rede com execução bem-sucedida.
     Finalized { inclusion: BlockInclusion },
+    /// Incluída em um bloco já finalizado, mas revertida/falha na execução on-chain.
+    FinalizedFailed {
+        inclusion: BlockInclusion,
+        reason: String,
+    },
     /// A janela de validade da transação expirou sem inclusão (ex: blockhash expirado na Solana).
     Expired { current_block_height: u64 },
 }
@@ -247,6 +257,16 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
                 record.version += 1;
                 return self.store.compare_and_swap(record).await;
             }
+            ObservationStatus::FinalizedFailed { inclusion, reason } => {
+                if let TxState::IncludedTentative { inclusion: prev } = &record.state
+                    && prev != &inclusion
+                {
+                    record.reorg_count += 1;
+                }
+                record.state = TxState::FinalizedFailed { inclusion, reason };
+                record.version += 1;
+                return self.store.compare_and_swap(record).await;
+            }
             ObservationStatus::IncludedNotFinalized { inclusion, .. } => {
                 match &record.state {
                     TxState::IncludedTentative { inclusion: prev } if prev != &inclusion => {
@@ -297,6 +317,7 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
             TxState::Reorged { .. } => 1,
             TxState::IncludedTentative { .. }
             | TxState::Finalized { .. }
+            | TxState::FinalizedFailed { .. }
             | TxState::ExpiredOrFailed { .. } => return Ok(record),
         };
 
