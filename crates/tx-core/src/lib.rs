@@ -93,6 +93,7 @@ pub struct TxRecord {
     pub idempotency_key: IdempotencyKey,
     pub payload: SignedPayload,
     pub state: TxState,
+    pub reorg_count: u32,
     pub version: u64,
 }
 
@@ -117,9 +118,9 @@ pub enum CoreError {
 pub enum BroadcastOutcome {
     /// RPC aceitou o payload (ainda não significa inclusão nem finalidade).
     Accepted,
-    /// Timeout, queda de conexão, HTTP 429/502/504: resultado desconhecido, exige reenvio idêntico.
+    /// Timeout, queda de conexão, HTTP 429/502/504 ou estado ambíguo: exige reenvio idêntico.
     UnknownTimeout(String),
-    /// Rejeição definitiva antes de entrar no mempool (ex: assinatura inválida, formato corrompido).
+    /// Rejeição definitiva de formato/assinatura inválida que nunca poderá entrar na rede.
     DefinitiveReject(String),
 }
 
@@ -204,6 +205,7 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
             idempotency_key: key,
             payload,
             state: TxState::Prepared,
+            reorg_count: 0,
             version: 1,
         };
 
@@ -243,13 +245,12 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
             ObservationStatus::IncludedNotFinalized { inclusion, .. } => {
                 match &record.state {
                     TxState::IncludedTentative { inclusion: prev } if prev != &inclusion => {
-                        // O bloco mudou na mesma ou em outra altura: houve reorganização e reinclusão em outro bloco.
+                        record.reorg_count += 1;
                         record.state = TxState::IncludedTentative { inclusion };
                         record.version += 1;
                         return self.store.compare_and_swap(record).await;
                     }
                     TxState::IncludedTentative { .. } => {
-                        // Continua incluída no mesmo bloco provisório, aguardando finalidade.
                         return Ok(record);
                     }
                     _ => {
@@ -272,12 +273,11 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
                 return self.store.compare_and_swap(record).await;
             }
             ObservationStatus::Pending { .. } => {
-                // Se estava IncludedTentative e voltou a Pending, o bloco sofreu reorg e a tx saiu da cadeia canônica.
                 if let TxState::IncludedTentative { inclusion } = &record.state {
-                    let prev_reorgs = 1;
+                    record.reorg_count += 1;
                     record.state = TxState::Reorged {
                         previous_inclusion: inclusion.clone(),
-                        reorg_count: prev_reorgs,
+                        reorg_count: record.reorg_count,
                     };
                     record.version += 1;
                     record = self.store.compare_and_swap(record).await?;
@@ -301,12 +301,8 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
         record = self.store.compare_and_swap(record).await?;
 
         match self.chain.broadcast_raw(&record.payload).await {
-            BroadcastOutcome::Accepted | BroadcastOutcome::UnknownTimeout(_) => {
-                // Ambos mantêm SubmittedUnknown: timeout é tratado exatamente como resultado desconhecido.
-                Ok(record)
-            }
+            BroadcastOutcome::Accepted | BroadcastOutcome::UnknownTimeout(_) => Ok(record),
             BroadcastOutcome::DefinitiveReject(reason) => {
-                // Mesmo em rejeição, verificamos se não houve corrida; se for rejeição definitiva de formato/assinatura:
                 record.state = TxState::ExpiredOrFailed { reason };
                 record.version += 1;
                 self.store.compare_and_swap(record).await

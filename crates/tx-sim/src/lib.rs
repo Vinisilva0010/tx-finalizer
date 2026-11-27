@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tx_core::{
-    BlockInclusion, BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError, IdempotencyKey,
+    BroadcastOutcome, ChainAdapter, ChainConstraint, CoreError, IdempotencyKey,
     ObservationStatus, SignedPayload, TxRecord, TxSigner, TxStore,
 };
 
@@ -145,7 +145,7 @@ impl ChainAdapter for ChaosChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tx_core::{TxEngine, TxState};
+    use tx_core::{BlockInclusion, TxEngine, TxState};
 
     #[tokio::test]
     async fn concurrent_prepare_never_duplicates_signature_or_payload() {
