@@ -193,7 +193,7 @@ impl ChainAdapter for SolanaRpcAdapter {
             };
 
             if status.confirmation_status.as_deref() == Some("finalized") {
-                if let Some(tx_err) = status.err {
+                if let Some(_tx_err) = status.err {
                     return Ok(ObservationStatus::Expired {
                         current_block_height,
                     });
@@ -218,5 +218,131 @@ impl ChainAdapter for SolanaRpcAdapter {
         Ok(ObservationStatus::Pending {
             current_block_height,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tx_core::{IdempotencyKey, TxEngine, TxRecord, TxState, TxStore};
+
+    #[derive(Clone, Default)]
+    struct MemStore(Arc<Mutex<std::collections::HashMap<IdempotencyKey, TxRecord>>>);
+
+    #[async_trait]
+    impl TxStore for MemStore {
+        async fn get(&self, key: &IdempotencyKey) -> Result<Option<TxRecord>, CoreError> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        async fn insert_if_absent(&self, record: TxRecord) -> Result<TxRecord, CoreError> {
+            let mut g = self.0.lock().unwrap();
+            if let Some(e) = g.get(&record.idempotency_key) {
+                return Ok(e.clone());
+            }
+            g.insert(record.idempotency_key.clone(), record.clone());
+            Ok(record)
+        }
+        async fn compare_and_swap(&self, record: TxRecord) -> Result<TxRecord, CoreError> {
+            let mut g = self.0.lock().unwrap();
+            let cur = g.get(&record.idempotency_key).unwrap();
+            if cur.version + 1 != record.version {
+                return Err(CoreError::OptimisticLockConflict {
+                    expected: cur.version + 1,
+                });
+            }
+            g.insert(record.idempotency_key.clone(), record.clone());
+            Ok(record)
+        }
+    }
+
+    async fn spawn_mock_solana_rpc(responses: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let queue = Arc::new(Mutex::new(responses));
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = {
+                    let mut g = queue.lock().unwrap();
+                    if g.is_empty() {
+                        break;
+                    }
+                    g.remove(0)
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(http.as_bytes()).await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn solana_rpc_waits_for_finalized_not_confirmed() {
+        let script = vec![
+            // Ciclo 1: getSignatureStatuses -> null, getBlockHeight -> 100, sendTransaction -> sig1
+            r#"{"jsonrpc":"2.0","id":1,"result":{"value":[null]}}"#.into(),
+            r#"{"jsonrpc":"2.0","id":1,"result":100}"#.into(),
+            r#"{"jsonrpc":"2.0","id":1,"result":"5sigSolana111"}"#.into(),
+            // Ciclo 2: getSignatureStatuses -> confirmed (ainda não finalized!), getBlockHeight -> 105
+            r#"{"jsonrpc":"2.0","id":1,"result":{"value":[{"slot":250,"confirmationStatus":"confirmed","err":null}]}}"#.into(),
+            r#"{"jsonrpc":"2.0","id":1,"result":105}"#.into(),
+            // Ciclo 3: getSignatureStatuses -> finalized, getBlockHeight -> 136
+            r#"{"jsonrpc":"2.0","id":1,"result":{"value":[{"slot":250,"confirmationStatus":"finalized","err":null}]}}"#.into(),
+            r#"{"jsonrpc":"2.0","id":1,"result":136}"#.into(),
+        ];
+
+        let url = spawn_mock_solana_rpc(script).await;
+        let adapter = SolanaRpcAdapter::new(url, Duration::from_secs(1), true).unwrap();
+        let store = MemStore::default();
+        let key = IdempotencyKey("sol-http-1".into());
+        let payload = SignedPayload::new(
+            "5sigSolana111".into(),
+            Bytes::from_static(b"raw_solana_signed_tx_bytes"),
+            ChainConstraint::Solana {
+                recent_blockhash: "GHtXQBsoZHVnNFa9YevAzFr17DJjgHXk3ycTKD5xD3Zi".into(),
+                last_valid_block_height: 250,
+            },
+        );
+        store
+            .insert_if_absent(TxRecord {
+                idempotency_key: key.clone(),
+                payload,
+                state: TxState::Prepared,
+                reorg_count: 0,
+                version: 1,
+            })
+            .await
+            .unwrap();
+
+        let engine = TxEngine::new(store, adapter);
+
+        let r1 = engine.step(&key).await.unwrap();
+        assert_eq!(r1.state, TxState::SubmittedUnknown { attempts: 1 });
+
+        // "confirmed" na Solana NÃO libera finalidade -> fica IncludedTentative
+        let r2 = engine.step(&key).await.unwrap();
+        assert!(matches!(r2.state, TxState::IncludedTentative { .. }));
+
+        // Só quando RPC reporta "finalized" transita para Finalized
+        let r3 = engine.step(&key).await.unwrap();
+        assert_eq!(
+            r3.state,
+            TxState::Finalized {
+                inclusion: BlockInclusion {
+                    block_number: 250,
+                    block_hash: "slot:250".into(),
+                }
+            }
+        );
     }
 }

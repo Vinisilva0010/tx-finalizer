@@ -237,3 +237,159 @@ impl ChainAdapter for EvmRpcAdapter {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tx_core::{IdempotencyKey, TxEngine, TxRecord, TxState, TxStore};
+
+    #[derive(Clone, Default)]
+    struct MemStore(Arc<Mutex<std::collections::HashMap<IdempotencyKey, TxRecord>>>);
+
+    #[async_trait]
+    impl TxStore for MemStore {
+        async fn get(&self, key: &IdempotencyKey) -> Result<Option<TxRecord>, CoreError> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+        async fn insert_if_absent(&self, record: TxRecord) -> Result<TxRecord, CoreError> {
+            let mut g = self.0.lock().unwrap();
+            if let Some(e) = g.get(&record.idempotency_key) {
+                return Ok(e.clone());
+            }
+            g.insert(record.idempotency_key.clone(), record.clone());
+            Ok(record)
+        }
+        async fn compare_and_swap(&self, record: TxRecord) -> Result<TxRecord, CoreError> {
+            let mut g = self.0.lock().unwrap();
+            let cur = g.get(&record.idempotency_key).unwrap();
+            if cur.version + 1 != record.version {
+                return Err(CoreError::OptimisticLockConflict {
+                    expected: cur.version + 1,
+                });
+            }
+            g.insert(record.idempotency_key.clone(), record.clone());
+            Ok(record)
+        }
+    }
+
+    async fn spawn_mock_evm_rpc(responses: Vec<(u16, String, u64)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let queue = Arc::new(Mutex::new(responses));
+
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let next = {
+                    let mut g = queue.lock().unwrap();
+                    if g.is_empty() {
+                        break;
+                    }
+                    g.remove(0)
+                };
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let (status, body, delay_ms) = next;
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                let http = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(http.as_bytes()).await;
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn evm_rpc_handles_timeout_reorg_and_finality() {
+        // Sequência de chamadas RPC feitas pelos 3 ciclos de `engine.step`:
+        // Ciclo 1:
+        //   1. eth_getBlockByNumber("latest") -> 0x10 (16)
+        //   2. eth_getBlockByNumber("finalized") -> 0x0a (10)
+        //   3. eth_getTransactionReceipt -> null
+        //   4. eth_sendRawTransaction -> delay de 250ms (maior que timeout de 80ms -> UnknownTimeout)
+        // Ciclo 2:
+        //   5. eth_getBlockByNumber("latest") -> 0x11 (17)
+        //   6. eth_getBlockByNumber("finalized") -> 0x0c (12)
+        //   7. eth_getTransactionReceipt -> incluído no bloco 0x11 com hash 0xorphan
+        // Ciclo 3:
+        //   8. eth_getBlockByNumber("latest") -> 0x15 (21)
+        //   9. eth_getBlockByNumber("finalized") -> 0x12 (18)
+        //  10. eth_getTransactionReceipt -> reincluído no bloco 0x12 com hash 0xcanonical
+        //  11. eth_getBlockByNumber("0x12") -> hash 0xcanonical (confirma que não houve reorg nesse bloco)
+        let script = vec![
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x10","hash":"0x10"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x0a","hash":"0x0a"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":null}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":"0xtx1"}"#.into(), 250),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x11","hash":"0x11"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x0c","hash":"0x0c"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"blockNumber":"0x11","blockHash":"0xorphan"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x15","hash":"0x15"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x12","hash":"0x12"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"blockNumber":"0x12","blockHash":"0xcanonical"}}"#.into(), 0),
+            (200, r#"{"jsonrpc":"2.0","id":1,"result":{"number":"0x12","hash":"0xcanonical"}}"#.into(), 0),
+        ];
+
+        let url = spawn_mock_evm_rpc(script).await;
+        let adapter = EvmRpcAdapter::new(url, Duration::from_millis(80)).unwrap();
+        let store = MemStore::default();
+        let key = IdempotencyKey("evm-http-1".into());
+        let payload = SignedPayload::new(
+            "0xtx1".into(),
+            Bytes::from_static(b"\x02\xf8\x01\x02\x03"),
+            ChainConstraint::Evm {
+                chain_id: 1,
+                nonce: 5,
+            },
+        );
+        store
+            .insert_if_absent(TxRecord {
+                idempotency_key: key.clone(),
+                payload,
+                state: TxState::Prepared,
+                reorg_count: 0,
+                version: 1,
+            })
+            .await
+            .unwrap();
+
+        let engine = TxEngine::new(store, adapter);
+
+        // Ciclo 1: timeout tratado como SubmittedUnknown
+        let r1 = engine.step(&key).await.unwrap();
+        assert_eq!(r1.state, TxState::SubmittedUnknown { attempts: 1 });
+
+        // Ciclo 2: incluída em bloco provisório (0x11 > finalized 0x0c)
+        let r2 = engine.step(&key).await.unwrap();
+        assert_eq!(
+            r2.state,
+            TxState::IncludedTentative {
+                inclusion: BlockInclusion {
+                    block_number: 17,
+                    block_hash: "0xorphan".into(),
+                }
+            }
+        );
+
+        // Ciclo 3: bloco 0x12 <= finalized 0x12 e hash canônico confere -> Finalized (reorg_count == 1)
+        let r3 = engine.step(&key).await.unwrap();
+        assert_eq!(r3.reorg_count, 1);
+        assert_eq!(
+            r3.state,
+            TxState::Finalized {
+                inclusion: BlockInclusion {
+                    block_number: 18,
+                    block_hash: "0xcanonical".into(),
+                }
+            }
+        );
+    }
+}
