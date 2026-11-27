@@ -18,6 +18,7 @@ pub struct EvmRpcAdapter {
 impl EvmRpcAdapter {
     pub fn new(rpc_url: impl Into<String>, request_timeout: Duration) -> Result<Self, CoreError> {
         let client = Client::builder()
+            .pool_max_idle_per_host(0)
             .timeout(request_timeout)
             .build()
             .map_err(|e| CoreError::Storage(format!("falha ao criar cliente HTTP EVM: {e}")))?;
@@ -290,17 +291,20 @@ mod tests {
                     }
                     g.remove(0)
                 };
-                let mut buf = [0u8; 4096];
-                let _ = socket.read(&mut buf).await;
-                let (status, body, delay_ms) = next;
-                if delay_ms > 0 {
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                }
-                let http = format!(
-                    "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = socket.write_all(http.as_bytes()).await;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let (status, body, delay_ms) = next;
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+                    let http = format!(
+                        "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(http.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
             }
         });
 

@@ -23,6 +23,7 @@ impl SolanaRpcAdapter {
         skip_preflight: bool,
     ) -> Result<Self, CoreError> {
         let client = Client::builder()
+            .pool_max_idle_per_host(0)
             .timeout(request_timeout)
             .build()
             .map_err(|e| CoreError::Storage(format!("falha ao criar cliente HTTP Solana: {e}")))?;
@@ -280,6 +281,7 @@ mod tests {
                     body.len()
                 );
                 let _ = socket.write_all(http.as_bytes()).await;
+                let _ = socket.shutdown().await;
             }
         });
 

@@ -238,6 +238,11 @@ impl<S: TxStore, C: ChainAdapter> TxEngine<S, C> {
 
         match obs {
             ObservationStatus::Finalized { inclusion } => {
+                if let TxState::IncludedTentative { inclusion: prev } = &record.state
+                    && prev != &inclusion
+                {
+                    record.reorg_count += 1;
+                }
                 record.state = TxState::Finalized { inclusion };
                 record.version += 1;
                 return self.store.compare_and_swap(record).await;
