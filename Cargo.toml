@@ -5,6 +5,7 @@ members = [
     "crates/tx-evm",
     "crates/tx-solana",
     "crates/tx-sim",
+    "crates/tx-store-pg",
 ]
 
 [workspace.package]
@@ -27,3 +28,8 @@ tokio = { version = "1", features = ["full"] }
 version = "0.12"
 default-features = false
 features = ["json", "rustls-tls"]
+
+[workspace.dependencies.sqlx]
+version = "0.8"
+default-features = false
+features = ["runtime-tokio", "tls-rustls", "postgres", "json", "migrate", "macros"]
